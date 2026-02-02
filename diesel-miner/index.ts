@@ -1,0 +1,482 @@
+#!/usr/bin/env tsx
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║              DIESEL AUTONOMOUS MINER v1.0                    ║
+ * ║                                                              ║
+ * ║  Mines DIESEL tokens on Bitcoin L1 via Alkanes protocol.     ║
+ * ║  Runs autonomously until wallet balance is depleted.         ║
+ * ║                                                              ║
+ * ║  Strategy: Mint in 0.17-0.2 sat/vB range (profitable ≤1.5)  ║
+ * ║  Formula:  n* = √(N*·M) - M  where N* = Rp/2f              ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ */
+
+import 'dotenv/config';
+
+import { createWallet, generateWallet, type WalletInfo } from './wallet.js';
+import {
+  fetchMempoolFees,
+  fetchUtxos,
+  fetchBalance,
+  scanCompetition,
+  fetchBlockHeight,
+  fetchDieselPrice,
+  checkTxStatus,
+  type UTXO,
+  type MempoolFees,
+  type CompetitionScan,
+} from './network.js';
+import { calculateStrategy, shouldAutoRbf, type StrategyResult } from './strategy.js';
+import {
+  executeChainMint,
+  rbfLastTx,
+  getEffectiveRate,
+  type ChainState,
+} from './minter.js';
+import {
+  POLL_INTERVAL_MS,
+  MIN_BALANCE_SATS,
+  DEFAULT_BLOCK_REWARD,
+  DEFAULT_DIESEL_PRICE_SATS,
+  MAX_CHAIN_LENGTH,
+  RBF_BUFFER_FACTOR,
+  POST_CONFIRM_DELAY_MS,
+  TX_VSIZE,
+} from './config.js';
+
+// ═══════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════
+
+interface MinerState {
+  wallet: WalletInfo;
+  chain: ChainState | null;
+  lastBlockHeight: number;
+  totalMined: number;
+  totalFeesPaid: number;
+  cyclesCompleted: number;
+  startTime: number;
+  dieselPrice: number;
+  blockReward: number;
+  isMinting: boolean;
+  isRbfing: boolean;
+  lastError: string | null;
+  consecutiveErrors: number;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LOGGING
+// ═══════════════════════════════════════════════════════════════
+
+const COLORS = {
+  reset: '\x1b[0m',
+  bright: '\x1b[1m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+  white: '\x1b[37m',
+  gray: '\x1b[90m',
+};
+
+function log(msg: string, color = COLORS.white) {
+  const ts = new Date().toISOString().replace('T', ' ').replace('Z', '');
+  console.log(`${COLORS.gray}[${ts}]${COLORS.reset} ${color}${msg}${COLORS.reset}`);
+}
+
+function logHeader(msg: string) {
+  console.log(`\n${COLORS.cyan}${'═'.repeat(60)}${COLORS.reset}`);
+  console.log(`${COLORS.bright}${COLORS.cyan}  ${msg}${COLORS.reset}`);
+  console.log(`${COLORS.cyan}${'═'.repeat(60)}${COLORS.reset}`);
+}
+
+function logStatus(fees: MempoolFees, scan: CompetitionScan, balance: number, state: MinerState) {
+  const eff = state.chain ? getEffectiveRate(state.chain).toFixed(3) : '---';
+  const chainLen = state.chain?.chainLength ?? 0;
+
+  console.log(
+    `${COLORS.gray}  FEE ${COLORS.yellow}${fees.nextBlockFee.toFixed(3)}${COLORS.gray} sat/vB | ` +
+    `COMP ${COLORS.magenta}${scan.dieselMints}${COLORS.gray} | ` +
+    `CHAIN ${COLORS.cyan}${chainLen}/${MAX_CHAIN_LENGTH}${COLORS.gray} @ ${COLORS.cyan}${eff}${COLORS.gray} eff | ` +
+    `BAL ${COLORS.green}${(balance / 1e8).toFixed(8)}${COLORS.gray} BTC | ` +
+    `MINED ${COLORS.bright}${state.totalMined}${COLORS.gray} TXs${COLORS.reset}`
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CORE MINING LOOP
+// ═══════════════════════════════════════════════════════════════
+
+async function runMiningLoop(state: MinerState): Promise<void> {
+  log('Mining loop active — monitoring conditions...', COLORS.green);
+  let lastFundingNotice = 0;
+
+  while (true) {
+    try {
+      // ─── 1. Fetch current conditions ───────────────────
+      const [fees, balance, blockHeight] = await Promise.all([
+        fetchMempoolFees(),
+        fetchBalance(state.wallet.address),
+        fetchBlockHeight(),
+      ]);
+
+      // Scan competition
+      const scan = await scanCompetition(fees.nextBlockFee);
+
+      // Update diesel price periodically
+      if (state.cyclesCompleted % 10 === 0) {
+        const price = await fetchDieselPrice();
+        if (price && price > 0) {
+          state.dieselPrice = price;
+        }
+      }
+
+      // New block detected
+      if (blockHeight > state.lastBlockHeight && state.lastBlockHeight > 0) {
+        log(`🧱 New block: ${blockHeight}`, COLORS.green);
+        state.lastBlockHeight = blockHeight;
+      } else if (state.lastBlockHeight === 0) {
+        state.lastBlockHeight = blockHeight;
+      }
+
+      // Always log status — this is the monitoring output
+      logStatus(fees, scan, balance.total, state);
+
+      // Evaluate strategy regardless of balance (so we see whether conditions are right)
+      const activeChainLen = state.chain?.chainLength ?? 0;
+      const activeRate = state.chain ? getEffectiveRate(state.chain) : 0;
+      const strategy = calculateStrategy({
+        feeRate: fees.nextBlockFee,
+        competition: scan.dieselMints,
+        blockReward: state.blockReward,
+        dieselPriceSats: state.dieselPrice,
+        activeChainLength: activeChainLen,
+        effectiveRate: activeRate,
+        minFeeForNextBlock: fees.nextBlockFee,
+      });
+
+      // ─── UNFUNDED: show strategy evaluation, wait ──────
+      if (balance.total < MIN_BALANCE_SATS && !state.chain) {
+        const now = Date.now();
+        if (strategy.shouldMine) {
+          log(`  📊 Conditions FAVORABLE: ${strategy.reason}`, COLORS.green);
+          log(
+            `${COLORS.gray}     n*=${COLORS.cyan}${strategy.optimalMints}${COLORS.gray} | ` +
+            `M=${COLORS.magenta}${strategy.effectiveCompetition}${COLORS.gray} | ` +
+            `ROI=${strategy.roi >= 0 ? COLORS.green : COLORS.red}${strategy.roi.toFixed(1)}%${COLORS.gray} | ` +
+            `EXP=${COLORS.cyan}${strategy.expectedEmission.toFixed(2)}${COLORS.gray} DSL${COLORS.reset}`, ''
+          );
+        } else {
+          log(`  📊 Conditions: ${strategy.reason}`, COLORS.gray);
+        }
+        // Periodic deposit reminder (every 2 minutes)
+        if (now - lastFundingNotice > 120_000) {
+          log(`  💰 Awaiting deposit to: ${state.wallet.address}`, COLORS.yellow);
+          lastFundingNotice = now;
+        }
+
+        // Reset errors and continue monitoring
+        state.consecutiveErrors = 0;
+        state.lastError = null;
+        await sleep(POLL_INTERVAL_MS);
+        continue;
+      }
+
+      // ─── 2. Check active chain status ──────────────────
+      if (state.chain) {
+        const firstTxStatus = await checkTxStatus(state.chain.txids[0]);
+        
+        if (firstTxStatus.confirmed) {
+          // Chain confirmed!
+          log(`✅ Chain CONFIRMED (${state.chain.chainLength} TXs, ${state.chain.totalFees} sats fees)`, COLORS.green);
+          state.cyclesCompleted++;
+          state.totalFeesPaid += state.chain.totalFees;
+          state.chain = null;
+          
+          // Brief pause before next cycle
+          await sleep(POST_CONFIRM_DELAY_MS);
+          continue;
+        }
+
+        // ─── 3. Auto-RBF if needed ────────────────────────
+        const effectiveRate = getEffectiveRate(state.chain);
+        const rbfCheck = shouldAutoRbf(
+          effectiveRate,
+          fees.nextBlockFee,
+          true,
+          RBF_BUFFER_FACTOR,
+        );
+
+        if (rbfCheck.shouldRbf && !state.isRbfing && !state.isMinting) {
+          log(`⚡ Auto-RBF: ${rbfCheck.reason}`, COLORS.yellow);
+          state.isRbfing = true;
+          
+          try {
+            state.chain = await rbfLastTx(state.wallet, state.chain, rbfCheck.targetRate);
+            const newRate = getEffectiveRate(state.chain);
+            log(`  ✓ RBF OK: effective rate now ${newRate.toFixed(3)} sat/vB`, COLORS.green);
+          } catch (err) {
+            log(`  ✗ RBF failed: ${(err as Error).message}`, COLORS.red);
+          } finally {
+            state.isRbfing = false;
+          }
+        }
+
+        // ─── 4. Extend chain if possible ──────────────────
+        if (state.chain.chainLength < MAX_CHAIN_LENGTH && !state.isMinting && !state.isRbfing) {
+          if (strategy.shouldMine && strategy.optimalMints > 0) {
+            const toMint = Math.min(
+              strategy.optimalMints,
+              MAX_CHAIN_LENGTH - state.chain.chainLength
+            );
+
+            if (toMint > 0) {
+              log(`➕ Extending chain: +${toMint} TXs (${strategy.reason})`, COLORS.cyan);
+              state.isMinting = true;
+
+              try {
+                const dummyUtxo: UTXO = {
+                  txid: state.chain.lastOutput.txid,
+                  vout: state.chain.lastOutput.vout,
+                  value: state.chain.lastOutput.value,
+                  confirmed: false,
+                };
+
+                state.chain = await executeChainMint(
+                  state.wallet,
+                  dummyUtxo,
+                  toMint,
+                  fees.nextBlockFee,
+                  state.chain,
+                );
+
+                state.totalMined += toMint;
+                log(`  ✓ Chain extended to ${state.chain.chainLength}/${MAX_CHAIN_LENGTH}`, COLORS.green);
+              } catch (err) {
+                log(`  ✗ Chain extension failed: ${(err as Error).message}`, COLORS.red);
+              } finally {
+                state.isMinting = false;
+              }
+            }
+          }
+        }
+
+      } else {
+        // ─── 5. No active chain - evaluate new mint ───────
+        if (strategy.shouldMine && strategy.optimalMints > 0 && !state.isMinting) {
+          logNewMintDecision(strategy, fees, scan);
+
+          // Select best UTXO (largest confirmed)
+          const utxos = await fetchUtxos(state.wallet.address);
+          const confirmedUtxos = utxos.filter(u => u.confirmed);
+          
+          if (confirmedUtxos.length === 0) {
+            log('  ⏳ No confirmed UTXOs available, waiting...', COLORS.yellow);
+          } else {
+            const bestUtxo = confirmedUtxos[0]; // Largest
+            const minNeeded = strategy.optimalMints * Math.ceil(TX_VSIZE * fees.nextBlockFee + 330);
+            
+            if (bestUtxo.value < minNeeded) {
+              log(`  ⚠ Best UTXO (${bestUtxo.value} sats) too small for ${strategy.optimalMints} mints`, COLORS.yellow);
+            } else {
+              state.isMinting = true;
+              
+              try {
+                state.chain = await executeChainMint(
+                  state.wallet,
+                  bestUtxo,
+                  strategy.optimalMints,
+                  fees.nextBlockFee,
+                );
+
+                state.totalMined += strategy.optimalMints;
+                log(
+                  `  ✓ Chain created: ${state.chain.chainLength} TXs, ` +
+                  `${state.chain.totalFees} sats fees, ` +
+                  `effective rate: ${getEffectiveRate(state.chain).toFixed(3)} sat/vB`,
+                  COLORS.green
+                );
+              } catch (err) {
+                log(`  ✗ Mint failed: ${(err as Error).message}`, COLORS.red);
+                state.chain = null;
+              } finally {
+                state.isMinting = false;
+              }
+            }
+          }
+        } else if (!strategy.shouldMine) {
+          // Waiting mode - show why
+          log(`  💤 ${strategy.reason}`, COLORS.gray);
+        }
+      }
+
+      // Reset consecutive errors on success
+      state.consecutiveErrors = 0;
+      state.lastError = null;
+
+    } catch (err) {
+      state.consecutiveErrors++;
+      state.lastError = (err as Error).message;
+      log(`❌ Error: ${state.lastError}`, COLORS.red);
+
+      if (state.consecutiveErrors >= 10) {
+        log('Too many consecutive errors. Pausing for 60s...', COLORS.red);
+        await sleep(60_000);
+        state.consecutiveErrors = 0;
+      }
+    }
+
+    // Wait before next loop iteration
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
+function logNewMintDecision(strategy: StrategyResult, fees: MempoolFees, scan: CompetitionScan) {
+  log(`🔥 MINING: ${strategy.reason}`, COLORS.bright + COLORS.green);
+  console.log(
+    `${COLORS.gray}  ` +
+    `n*=${COLORS.cyan}${strategy.optimalMints}${COLORS.gray} | ` +
+    `M=${COLORS.magenta}${strategy.effectiveCompetition}${COLORS.gray} | ` +
+    `ROI=${strategy.roi >= 0 ? COLORS.green : COLORS.red}${strategy.roi.toFixed(1)}%${COLORS.gray} | ` +
+    `EXP=${COLORS.cyan}${strategy.expectedEmission.toFixed(2)}${COLORS.gray} DSL | ` +
+    `COST=${COLORS.yellow}${Math.round(strategy.totalCostSats)}${COLORS.gray} sats | ` +
+    `NET=${strategy.netProfitSats >= 0 ? COLORS.green : COLORS.red}${Math.round(strategy.netProfitSats)}${COLORS.gray} sats${COLORS.reset}`
+  );
+}
+
+function printSummary(state: MinerState) {
+  const elapsed = (Date.now() - state.startTime) / 1000 / 60;
+  logHeader('MINING SESSION SUMMARY');
+  console.log(`  Address:          ${state.wallet.address}`);
+  console.log(`  Runtime:          ${elapsed.toFixed(1)} minutes`);
+  console.log(`  Total TXs mined:  ${state.totalMined}`);
+  console.log(`  Cycles completed: ${state.cyclesCompleted}`);
+  console.log(`  Total fees paid:  ${state.totalFeesPaid} sats (${(state.totalFeesPaid / 1e8).toFixed(8)} BTC)`);
+  console.log('');
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ENTRY POINT
+// ═══════════════════════════════════════════════════════════════
+
+async function main() {
+  console.log(`
+${COLORS.cyan}╔═══════════════════════════════════════════════════════════════╗
+║              ${COLORS.bright}DIESEL AUTONOMOUS MINER v1.0${COLORS.reset}${COLORS.cyan}                    ║
+║                                                               ║
+║  Strategy: mint @ 0.17-0.20 sat/vB (profitable up to ~1.5)   ║
+║  Formula:  n* = √(N*·M) - M  where N* = Rp/2f               ║
+║  Features: auto-chain, auto-RBF, competition scanning         ║
+╚═══════════════════════════════════════════════════════════════╝${COLORS.reset}
+`);
+
+  // Get mnemonic from environment or argument
+  const mnemonic = process.env.MNEMONIC || process.argv[2];
+
+  if (!mnemonic) {
+    console.log(`${COLORS.yellow}Usage:${COLORS.reset}`);
+    console.log(`  MNEMONIC="word1 word2 ... word12" npx tsx index.ts`);
+    console.log(`  npx tsx index.ts "word1 word2 ... word12"`);
+    console.log('');
+    console.log(`${COLORS.gray}Or generate a new wallet:${COLORS.reset}`);
+    console.log('  npx tsx wallet-gen.ts');
+    console.log('');
+    process.exit(1);
+  }
+
+  // Create wallet
+  let wallet: WalletInfo;
+  try {
+    wallet = createWallet(mnemonic);
+  } catch (err) {
+    log(`Failed to create wallet: ${(err as Error).message}`, COLORS.red);
+    process.exit(1);
+  }
+
+  logHeader('WALLET');
+  console.log(`  Address: ${COLORS.bright}${wallet.address}${COLORS.reset}`);
+  console.log(`  Type:    P2TR (BIP86)`);
+  console.log(`  Path:    m/86'/0'/0'/0/0`);
+
+  // Fetch initial balance
+  try {
+    const balance = await fetchBalance(wallet.address);
+    console.log(`  Balance: ${COLORS.green}${(balance.total / 1e8).toFixed(8)} BTC${COLORS.reset} (${balance.total} sats)`);
+    console.log(`           Confirmed: ${balance.confirmed} | Unconfirmed: ${balance.unconfirmed}`);
+    if (balance.total < MIN_BALANCE_SATS) {
+      log(`Awaiting funding (need ≥${MIN_BALANCE_SATS} sats to begin mining)`, COLORS.yellow);
+      log(`Deposit BTC to: ${wallet.address}`, COLORS.yellow);
+      log(`Monitoring conditions in the meantime...`, COLORS.gray);
+    }
+  } catch (err) {
+    log(`Failed to fetch initial balance: ${(err as Error).message} — continuing anyway`, COLORS.yellow);
+  }
+
+  // Fetch block height
+  const blockHeight = await fetchBlockHeight();
+  console.log(`  Block:   ${blockHeight}`);
+
+  // Check for existing unconfirmed TXs (detect in-progress chains)
+  const utxos = await fetchUtxos(wallet.address);
+  const unconfirmedUtxos = utxos.filter(u => !u.confirmed);
+  if (unconfirmedUtxos.length > 0) {
+    log(`Found ${unconfirmedUtxos.length} unconfirmed UTXOs - may have existing chain`, COLORS.yellow);
+  }
+
+  // Initialize state
+  const state: MinerState = {
+    wallet,
+    chain: null,
+    lastBlockHeight: blockHeight,
+    totalMined: 0,
+    totalFeesPaid: 0,
+    cyclesCompleted: 0,
+    startTime: Date.now(),
+    dieselPrice: DEFAULT_DIESEL_PRICE_SATS,
+    blockReward: DEFAULT_BLOCK_REWARD,
+    isMinting: false,
+    isRbfing: false,
+    lastError: null,
+    consecutiveErrors: 0,
+  };
+
+  // Fetch initial diesel price
+  const price = await fetchDieselPrice();
+  if (price && price > 0) {
+    state.dieselPrice = price;
+    log(`DIESEL price: ${price.toFixed(2)} sats`, COLORS.cyan);
+  } else {
+    log(`Using default DIESEL price: ${DEFAULT_DIESEL_PRICE_SATS} sats`, COLORS.yellow);
+  }
+
+  logHeader('MINING STARTED');
+
+  // Handle graceful shutdown
+  process.on('SIGINT', () => {
+    console.log('');
+    log('Received SIGINT, shutting down...', COLORS.yellow);
+    printSummary(state);
+    process.exit(0);
+  });
+
+  process.on('SIGTERM', () => {
+    log('Received SIGTERM, shutting down...', COLORS.yellow);
+    printSummary(state);
+    process.exit(0);
+  });
+
+  // Start mining
+  await runMiningLoop(state);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+main().catch(err => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});

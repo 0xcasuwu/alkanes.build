@@ -1,0 +1,25 @@
+{
+  "name": "diesel-miner",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "tsx index.ts",
+    "generate-wallet": "tsx wallet-gen.ts"
+  },
+  "dependencies": {
+    "@bitcoinerlab/secp256k1": "^1.2.0",
+    "@noble/hashes": "^2.0.1",
+    "bip32": "^5.0.0",
+    "bip39": "^3.1.0",
+    "bitcoinjs-lib": "^7.0.0",
+    "dotenv": "^17.2.3",
+    "ecpair": "^3.0.0",
+    "tiny-secp256k1": "^2.2.4",
+    "undici": "^7.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  }
+}
