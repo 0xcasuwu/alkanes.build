@@ -1,14 +1,15 @@
 /**
  * Strategy Module - Optimal DIESEL Minting Calculation
  * 
- * Implements the formula: n* = √(N* × M) - M
- * where N* = R × p / (2 × f)
+ * CORE INSIGHT: The amount we spend must be LESS than the BTC value we receive.
  * 
- * R = block reward in DIESEL
- * p = DIESEL price in sats
- * f = TX cost in sats
- * M = competing mints
- * n* = optimal number of our mints
+ * Revenue = (n / (M + n)) × block_reward × (1 - fee) × diesel_price
+ * Cost = n × TX_VSIZE × fee_rate
+ * 
+ * We must ensure: Revenue > Cost (after applying competition buffer)
+ * 
+ * Formula for optimal n: n* = √(N* × M) - M
+ * where N* = R × p / (2 × f)
  */
 
 import {
@@ -21,12 +22,14 @@ import {
   MAX_FEE_RATE,
   PREFERRED_MIN_FEE,
   PREFERRED_MAX_FEE,
+  COMPETITION_BUFFER,
+  MIN_ROI_THRESHOLD,
 } from './config.js';
 
 export interface StrategyInput {
   /** Current mempool fee rate (sat/vB) */
   feeRate: number;
-  /** Number of competing DIESEL mints in mempool */
+  /** Number of competing DIESEL mints in mempool (observed now) */
   competition: number;
   /** Block reward in DIESEL */
   blockReward: number;
@@ -38,39 +41,46 @@ export interface StrategyInput {
   effectiveRate: number;
   /** Minimum fee for next block (from mempool) */
   minFeeForNextBlock: number;
+  /** Is this within the mining window (waited long enough since last block)? */
+  inMiningWindow: boolean;
 }
 
 export interface StrategyResult {
-  /** Whether we should mine */
+  /** Whether we should mine NOW */
   shouldMine: boolean;
   /** Optimal number of mints */
   optimalMints: number;
   /** Expected DIESEL emission for our mints */
   expectedEmission: number;
-  /** Total cost in sats */
+  /** Total cost in sats (what we spend on fees) */
   totalCostSats: number;
-  /** Net profit in sats */
+  /** Expected value in sats (what we get back) */
+  expectedValueSats: number;
+  /** Net profit in sats (value - cost) */
   netProfitSats: number;
   /** ROI percentage */
   roi: number;
-  /** Whether the strategy is profitable */
+  /** Whether profitable at buffered M */
   isProfitable: boolean;
   /** Reason for decision */
   reason: string;
-  /** N* threshold value */
-  nStar: number;
-  /** Breakeven competition level */
-  breakevenM: number;
-  /** Whether fee is in preferred range */
-  feeInPreferredRange: boolean;
-  /** Whether fee is in acceptable range */
-  feeInRange: boolean;
-  /** Effective competition (M minus our competing chain) */
-  effectiveCompetition: number;
+  /** Current observed M */
+  currentM: number;
+  /** Buffered M used for calculation (pessimistic) */
+  bufferedM: number;
+  /** Whether we're in the mining window */
+  inMiningWindow: boolean;
 }
 
 /**
  * Calculate optimal minting strategy
+ * 
+ * CORE RULE: Don't mine unless:
+ *   expected_value_sats > cost_sats (at buffered M)
+ *   ROI > MIN_ROI_THRESHOLD
+ *   In mining window (waited long enough since last block)
+ * 
+ * The buffer accounts for other miners piling in after us.
  */
 export function calculateStrategy(input: StrategyInput): StrategyResult {
   const {
@@ -81,64 +91,77 @@ export function calculateStrategy(input: StrategyInput): StrategyResult {
     activeChainLength,
     effectiveRate,
     minFeeForNextBlock,
+    inMiningWindow,
   } = input;
 
-  const feeInPreferredRange = feeRate >= PREFERRED_MIN_FEE && feeRate <= PREFERRED_MAX_FEE;
   const feeInRange = feeRate >= MIN_FEE_RATE && feeRate <= MAX_FEE_RATE;
+  const feeInPreferredRange = feeRate >= PREFERRED_MIN_FEE && feeRate <= PREFERRED_MAX_FEE;
 
-  // Calculate effective competition
-  // Subtract our chain from M only if we're competing for next block
+  // Subtract our chain from M if we're already competing
   const weAreCompeting = effectiveRate >= minFeeForNextBlock;
   const chainToSubtract = weAreCompeting ? activeChainLength : 0;
-  const M = Math.max(0, competition - chainToSubtract);
+  const currentM = Math.max(0, competition - chainToSubtract);
 
-  // Pool after protocol fee
-  const pool = Math.max(0, blockReward - DIESEL_FEE);
+  // Apply competition buffer - assume M will grow before block confirms
+  // This is pessimistic: if we're profitable at bufferedM, we're definitely
+  // profitable if fewer miners show up
+  const bufferedM = Math.ceil(currentM * COMPETITION_BUFFER);
 
-  // TX cost in sats
-  const txCost = feeRate * TX_VSIZE;
+  // Pool after protocol fee (what's actually distributed)
+  const pool = blockReward * (1 - DIESEL_FEE);
 
-  // N* = R × p / (2 × f)
-  const nStar = (blockReward * dieselPriceSats) / (2 * txCost);
-  const breakevenM = nStar / 4;
+  // Cost per mint in sats
+  const costPerMint = Math.ceil(feeRate * TX_VSIZE);
 
-  // Calculate optimal mints: n* = √(N* × M) - M
-  const rawOptimal = M > 0 ? Math.sqrt(nStar * M) - M : 0;
+  // N* = R × p / (2 × f) — theoretical break-even point
+  const nStar = (blockReward * dieselPriceSats) / (2 * costPerMint);
 
-  // Check if single mint is profitable
-  const singleMintRevenue = (pool * dieselPriceSats) / (1 + M);
-  const singleMintProfitable = singleMintRevenue > txCost;
-
-  // Determine optimal count
-  let optimalMints: number;
-  if (rawOptimal >= 1) {
-    optimalMints = Math.round(rawOptimal);
-  } else if (singleMintProfitable) {
-    optimalMints = 1;
-  } else {
-    optimalMints = 0;
-  }
-
-  // Cap at chain limit (accounting for existing chain)
+  // Optimal mints: n* = √(N* × M) - M
+  // Use bufferedM for conservative estimate
+  const rawOptimal = bufferedM > 0 ? Math.sqrt(nStar * bufferedM) - bufferedM : nStar;
+  
+  // Cap at available slots
   const availableSlots = MAX_CHAIN_LENGTH - activeChainLength;
-  optimalMints = Math.min(optimalMints, availableSlots);
+  let optimalMints = Math.min(Math.max(0, Math.floor(rawOptimal)), availableSlots);
 
-  // Calculate expected returns
-  const totalMints = optimalMints + M;
-  let expectedEmission = 0;
-  let costDiesel = 0;
-  const txCostDiesel = txCost / dieselPriceSats;
+  // Calculate expected returns at buffered M
+  // Our share: n / (bufferedM + n)
+  // Value: share × pool × price
+  const totalMiners = bufferedM + optimalMints;
+  const ourShare = totalMiners > 0 ? optimalMints / totalMiners : 0;
+  const expectedEmission = ourShare * pool;
+  const expectedValueSats = expectedEmission * dieselPriceSats;
+  const totalCostSats = optimalMints * costPerMint;
+  const netProfitSats = expectedValueSats - totalCostSats;
+  const roi = totalCostSats > 0 ? (netProfitSats / totalCostSats) * 100 : 0;
 
-  if (optimalMints > 0 && totalMints > 0) {
-    expectedEmission = (optimalMints / totalMints) * pool;
-    costDiesel = optimalMints * txCostDiesel;
+  // Core profitability check: value > cost
+  const isProfitable = expectedValueSats > totalCostSats && roi >= MIN_ROI_THRESHOLD;
+
+  // If not profitable at current optimal, try fewer mints
+  if (!isProfitable && optimalMints > 1) {
+    // Maybe fewer mints is profitable
+    for (let n = optimalMints - 1; n >= 1; n--) {
+      const testShare = n / (bufferedM + n);
+      const testValue = testShare * pool * dieselPriceSats;
+      const testCost = n * costPerMint;
+      const testRoi = (testValue - testCost) / testCost * 100;
+      if (testValue > testCost && testRoi >= MIN_ROI_THRESHOLD) {
+        optimalMints = n;
+        break;
+      }
+    }
   }
 
-  const netProfit = expectedEmission - costDiesel;
-  const netProfitSats = netProfit * dieselPriceSats;
-  const totalCostSats = optimalMints * txCost;
-  const roi = totalCostSats > 0 ? (netProfitSats / totalCostSats) * 100 : 0;
-  const isProfitable = netProfit > 0;
+  // Recalculate with final optimalMints
+  const finalTotalMiners = bufferedM + optimalMints;
+  const finalShare = finalTotalMiners > 0 ? optimalMints / finalTotalMiners : 0;
+  const finalEmission = finalShare * pool;
+  const finalValueSats = finalEmission * dieselPriceSats;
+  const finalCostSats = optimalMints * costPerMint;
+  const finalNetProfitSats = finalValueSats - finalCostSats;
+  const finalRoi = finalCostSats > 0 ? (finalNetProfitSats / finalCostSats) * 100 : 0;
+  const finalProfitable = finalValueSats > finalCostSats && finalRoi >= MIN_ROI_THRESHOLD;
 
   // Decision logic
   let shouldMine = false;
@@ -146,35 +169,36 @@ export function calculateStrategy(input: StrategyInput): StrategyResult {
 
   if (!feeInRange) {
     reason = feeRate < MIN_FEE_RATE
-      ? `Fee ${feeRate.toFixed(3)} < min ${MIN_FEE_RATE} sat/vB`
-      : `Fee ${feeRate.toFixed(3)} > max ${MAX_FEE_RATE} sat/vB`;
+      ? `Fee ${feeRate.toFixed(3)} below min ${MIN_FEE_RATE}`
+      : `Fee ${feeRate.toFixed(3)} above max ${MAX_FEE_RATE}`;
   } else if (optimalMints <= 0) {
-    reason = `Not profitable at M=${M}`;
-  } else if (!isProfitable) {
-    reason = `Negative ROI: ${roi.toFixed(1)}%`;
+    reason = `No profitable mints at M=${currentM}→${bufferedM}`;
+  } else if (!finalProfitable) {
+    reason = `Not profitable: cost ${finalCostSats} sats > value ${Math.round(finalValueSats)} sats (M=${currentM}→${bufferedM})`;
   } else if (availableSlots <= 0) {
-    reason = `Chain full (${MAX_CHAIN_LENGTH}/${MAX_CHAIN_LENGTH})`;
+    reason = `Chain full (${MAX_CHAIN_LENGTH})`;
+  } else if (!inMiningWindow) {
+    // Profitable but too early - wait for mining window
+    reason = `WAIT: profitable (${finalRoi.toFixed(0)}% ROI) but too early - M may grow`;
   } else {
     shouldMine = true;
-    reason = feeInPreferredRange
-      ? `OPTIMAL: ${optimalMints} mints @ ${feeRate.toFixed(3)} sat/vB (${roi.toFixed(0)}% ROI)`
-      : `OK: ${optimalMints} mints @ ${feeRate.toFixed(3)} sat/vB (${roi.toFixed(0)}% ROI)`;
+    const tag = feeInPreferredRange ? 'OPTIMAL' : 'OK';
+    reason = `${tag}: ${optimalMints} mints, cost ${finalCostSats} < value ${Math.round(finalValueSats)} sats (${finalRoi.toFixed(0)}% ROI, M=${currentM}→${bufferedM})`;
   }
 
   return {
     shouldMine,
     optimalMints,
-    expectedEmission,
-    totalCostSats,
-    netProfitSats,
-    roi,
-    isProfitable,
+    expectedEmission: finalEmission,
+    totalCostSats: finalCostSats,
+    expectedValueSats: finalValueSats,
+    netProfitSats: finalNetProfitSats,
+    roi: finalRoi,
+    isProfitable: finalProfitable,
     reason,
-    nStar,
-    breakevenM,
-    feeInPreferredRange,
-    feeInRange,
-    effectiveCompetition: M,
+    currentM,
+    bufferedM,
+    inMiningWindow,
   };
 }
 

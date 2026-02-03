@@ -69,6 +69,27 @@ export const BLOCK_CHECK_INTERVAL_MS = 30_000;
 /** Full assessment interval when no new block (fallback) */
 export const IDLE_POLL_INTERVAL_MS = 180_000;
 
+/** 
+ * Mining window: only consider minting after this many ms since last block.
+ * Early minting = M will grow significantly before block confirms.
+ * Waiting = M is more settled, better profitability estimate.
+ * Default: 5 minutes (halfway through average block time)
+ */
+export const MINING_WINDOW_START_MS = 5 * 60 * 1000;
+
+/**
+ * Competition buffer: assume M will grow by this factor before block.
+ * Accounts for other miners piling in after us.
+ * 1.3 = assume 30% more competition than currently observed.
+ */
+export const COMPETITION_BUFFER = 1.3;
+
+/**
+ * Minimum ROI threshold after applying competition buffer.
+ * Must be profitable even with conservative M estimate.
+ */
+export const MIN_ROI_THRESHOLD = 25;
+
 /** Competition scan interval (ms) */
 export const COMPETITION_SCAN_INTERVAL_MS = 15_000;
 

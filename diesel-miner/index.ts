@@ -43,6 +43,7 @@ import {
   RBF_BUFFER_FACTOR,
   POST_CONFIRM_DELAY_MS,
   TX_VSIZE,
+  MINING_WINDOW_START_MS,
 } from './config.js';
 
 // ═══════════════════════════════════════════════════════════════
@@ -53,6 +54,7 @@ interface MinerState {
   wallet: WalletInfo;
   chain: ChainState | null;
   lastBlockHeight: number;
+  lastBlockTime: number;          // When last block was detected
   totalMined: number;
   totalFeesPaid: number;
   cyclesCompleted: number;
@@ -94,16 +96,26 @@ function logHeader(msg: string) {
   console.log(`${COLORS.cyan}${'═'.repeat(60)}${COLORS.reset}`);
 }
 
-function logStatus(fees: MempoolFees, scan: CompetitionScan, balance: number, state: MinerState) {
+function logStatus(
+  fees: MempoolFees, 
+  scan: CompetitionScan, 
+  balance: number, 
+  state: MinerState,
+  secondsSinceBlock: number,
+  inMiningWindow: boolean
+) {
   const eff = state.chain ? getEffectiveRate(state.chain).toFixed(3) : '---';
   const chainLen = state.chain?.chainLength ?? 0;
+  const mins = Math.floor(secondsSinceBlock / 60);
+  const secs = Math.floor(secondsSinceBlock % 60);
+  const windowStatus = inMiningWindow ? '✓' : `wait ${Math.ceil((MINING_WINDOW_START_MS/1000 - secondsSinceBlock)/60)}m`;
 
   console.log(
-    `${COLORS.gray}  FEE ${COLORS.yellow}${fees.nextBlockFee.toFixed(3)}${COLORS.gray} sat/vB | ` +
-    `COMP ${COLORS.magenta}${scan.dieselMints}${COLORS.gray} | ` +
-    `CHAIN ${COLORS.cyan}${chainLen}/${MAX_CHAIN_LENGTH}${COLORS.gray} @ ${COLORS.cyan}${eff}${COLORS.gray} eff | ` +
-    `BAL ${COLORS.green}${(balance / 1e8).toFixed(8)}${COLORS.gray} BTC | ` +
-    `MINED ${COLORS.bright}${state.totalMined}${COLORS.gray} TXs${COLORS.reset}`
+    `${COLORS.gray}  FEE ${COLORS.yellow}${fees.nextBlockFee.toFixed(3)}${COLORS.gray} | ` +
+    `M ${COLORS.magenta}${scan.dieselMints}${COLORS.gray} | ` +
+    `BLK ${COLORS.cyan}${mins}m${secs}s${COLORS.gray} [${windowStatus}] | ` +
+    `CHAIN ${COLORS.cyan}${chainLen}/${MAX_CHAIN_LENGTH}${COLORS.gray} @ ${COLORS.cyan}${eff}${COLORS.gray} | ` +
+    `BAL ${COLORS.green}${(balance / 1e8).toFixed(8)}${COLORS.reset}`
   );
 }
 
@@ -140,10 +152,12 @@ async function runMiningLoop(state: MinerState): Promise<void> {
 
       // ─── Full assessment ────────────────────────────────
       if (newBlockDetected) {
-        log(`🧱 New block: ${blockHeight} — assessing post-block conditions`, COLORS.green);
+        log(`🧱 New block: ${blockHeight} — resetting timer`, COLORS.green);
         state.lastBlockHeight = blockHeight;
+        state.lastBlockTime = Date.now();
       } else if (state.lastBlockHeight === 0) {
         state.lastBlockHeight = blockHeight;
+        state.lastBlockTime = Date.now();
       }
 
       const [fees, balance] = await Promise.all([
@@ -152,7 +166,15 @@ async function runMiningLoop(state: MinerState): Promise<void> {
       ]);
 
       const scan = await scanCompetition(fees.nextBlockFee);
-      lastFullAssessment = Date.now();
+      const now = Date.now();
+      lastFullAssessment = now;
+
+      // How long since last block?
+      const msSinceBlock = now - state.lastBlockTime;
+      const secondsSinceBlock = msSinceBlock / 1000;
+      
+      // Are we in the mining window? (waited long enough for M to settle)
+      const inMiningWindow = msSinceBlock >= MINING_WINDOW_START_MS || state.chain !== null;
 
       // Update diesel price periodically
       if (state.cyclesCompleted % 10 === 0) {
@@ -163,7 +185,7 @@ async function runMiningLoop(state: MinerState): Promise<void> {
       }
 
       // Log status
-      logStatus(fees, scan, balance.total, state);
+      logStatus(fees, scan, balance.total, state, secondsSinceBlock, inMiningWindow);
 
       // Evaluate strategy
       const activeChainLen = state.chain?.chainLength ?? 0;
@@ -176,6 +198,7 @@ async function runMiningLoop(state: MinerState): Promise<void> {
         activeChainLength: activeChainLen,
         effectiveRate: activeRate,
         minFeeForNextBlock: fees.nextBlockFee,
+        inMiningWindow,
       });
 
       // ─── UNFUNDED: show strategy evaluation, wait ──────
@@ -185,7 +208,7 @@ async function runMiningLoop(state: MinerState): Promise<void> {
           log(`  📊 Conditions FAVORABLE: ${strategy.reason}`, COLORS.green);
           log(
             `${COLORS.gray}     n*=${COLORS.cyan}${strategy.optimalMints}${COLORS.gray} | ` +
-            `M=${COLORS.magenta}${strategy.effectiveCompetition}${COLORS.gray} | ` +
+            `M=${COLORS.magenta}${strategy.currentM}${COLORS.gray} | ` +
             `ROI=${strategy.roi >= 0 ? COLORS.green : COLORS.red}${strategy.roi.toFixed(1)}%${COLORS.gray} | ` +
             `EXP=${COLORS.cyan}${strategy.expectedEmission.toFixed(2)}${COLORS.gray} DSL${COLORS.reset}`, ''
           );
@@ -356,7 +379,7 @@ function logNewMintDecision(strategy: StrategyResult, fees: MempoolFees, scan: C
   console.log(
     `${COLORS.gray}  ` +
     `n*=${COLORS.cyan}${strategy.optimalMints}${COLORS.gray} | ` +
-    `M=${COLORS.magenta}${strategy.effectiveCompetition}${COLORS.gray} | ` +
+    `M=${COLORS.magenta}${strategy.currentM}${COLORS.gray} | ` +
     `ROI=${strategy.roi >= 0 ? COLORS.green : COLORS.red}${strategy.roi.toFixed(1)}%${COLORS.gray} | ` +
     `EXP=${COLORS.cyan}${strategy.expectedEmission.toFixed(2)}${COLORS.gray} DSL | ` +
     `COST=${COLORS.yellow}${Math.round(strategy.totalCostSats)}${COLORS.gray} sats | ` +
@@ -448,6 +471,7 @@ ${COLORS.cyan}╔═════════════════════
     wallet,
     chain: null,
     lastBlockHeight: blockHeight,
+    lastBlockTime: Date.now(),
     totalMined: 0,
     totalFeesPaid: 0,
     cyclesCompleted: 0,
