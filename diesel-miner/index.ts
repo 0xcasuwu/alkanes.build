@@ -34,7 +34,8 @@ import {
   type ChainState,
 } from './minter.js';
 import {
-  POLL_INTERVAL_MS,
+  BLOCK_CHECK_INTERVAL_MS,
+  IDLE_POLL_INTERVAL_MS,
   MIN_BALANCE_SATS,
   DEFAULT_BLOCK_REWARD,
   DEFAULT_DIESEL_PRICE_SATS,
@@ -107,24 +108,51 @@ function logStatus(fees: MempoolFees, scan: CompetitionScan, balance: number, st
 }
 
 // ═══════════════════════════════════════════════════════════════
-// CORE MINING LOOP
+// CORE MINING LOOP (BLOCK-AWARE)
 // ═══════════════════════════════════════════════════════════════
 
 async function runMiningLoop(state: MinerState): Promise<void> {
-  log('Mining loop active — monitoring conditions...', COLORS.green);
+  log('Mining loop active — block-aware monitoring...', COLORS.green);
+  log(`  Block check: every ${BLOCK_CHECK_INTERVAL_MS/1000}s | Full assessment: on new block or every ${IDLE_POLL_INTERVAL_MS/60000}min`, COLORS.gray);
+  
   let lastFundingNotice = 0;
+  let lastFullAssessment = 0;
 
   while (true) {
     try {
-      // ─── 1. Fetch current conditions ───────────────────
-      const [fees, balance, blockHeight] = await Promise.all([
+      // ─── Quick block height check (cheap) ───────────────
+      const blockHeight = await fetchBlockHeight();
+      const newBlockDetected = blockHeight > state.lastBlockHeight && state.lastBlockHeight > 0;
+      const timeSinceAssessment = Date.now() - lastFullAssessment;
+      const hasActiveChain = state.chain !== null;
+      
+      // Decide whether to do full assessment
+      const shouldAssess = newBlockDetected || 
+                           timeSinceAssessment > IDLE_POLL_INTERVAL_MS ||
+                           hasActiveChain ||
+                           lastFullAssessment === 0;
+      
+      if (!shouldAssess) {
+        // Just a quick block check - sleep and continue
+        await sleep(BLOCK_CHECK_INTERVAL_MS);
+        continue;
+      }
+
+      // ─── Full assessment ────────────────────────────────
+      if (newBlockDetected) {
+        log(`🧱 New block: ${blockHeight} — assessing post-block conditions`, COLORS.green);
+        state.lastBlockHeight = blockHeight;
+      } else if (state.lastBlockHeight === 0) {
+        state.lastBlockHeight = blockHeight;
+      }
+
+      const [fees, balance] = await Promise.all([
         fetchMempoolFees(),
         fetchBalance(state.wallet.address),
-        fetchBlockHeight(),
       ]);
 
-      // Scan competition
       const scan = await scanCompetition(fees.nextBlockFee);
+      lastFullAssessment = Date.now();
 
       // Update diesel price periodically
       if (state.cyclesCompleted % 10 === 0) {
@@ -134,18 +162,10 @@ async function runMiningLoop(state: MinerState): Promise<void> {
         }
       }
 
-      // New block detected
-      if (blockHeight > state.lastBlockHeight && state.lastBlockHeight > 0) {
-        log(`🧱 New block: ${blockHeight}`, COLORS.green);
-        state.lastBlockHeight = blockHeight;
-      } else if (state.lastBlockHeight === 0) {
-        state.lastBlockHeight = blockHeight;
-      }
-
-      // Always log status — this is the monitoring output
+      // Log status
       logStatus(fees, scan, balance.total, state);
 
-      // Evaluate strategy regardless of balance (so we see whether conditions are right)
+      // Evaluate strategy
       const activeChainLen = state.chain?.chainLength ?? 0;
       const activeRate = state.chain ? getEffectiveRate(state.chain) : 0;
       const strategy = calculateStrategy({
@@ -172,16 +192,13 @@ async function runMiningLoop(state: MinerState): Promise<void> {
         } else {
           log(`  📊 Conditions: ${strategy.reason}`, COLORS.gray);
         }
-        // Periodic deposit reminder (every 2 minutes)
         if (now - lastFundingNotice > 120_000) {
           log(`  💰 Awaiting deposit to: ${state.wallet.address}`, COLORS.yellow);
           lastFundingNotice = now;
         }
-
-        // Reset errors and continue monitoring
         state.consecutiveErrors = 0;
         state.lastError = null;
-        await sleep(POLL_INTERVAL_MS);
+        await sleep(BLOCK_CHECK_INTERVAL_MS);
         continue;
       }
 
@@ -190,13 +207,10 @@ async function runMiningLoop(state: MinerState): Promise<void> {
         const firstTxStatus = await checkTxStatus(state.chain.txids[0]);
         
         if (firstTxStatus.confirmed) {
-          // Chain confirmed!
           log(`✅ Chain CONFIRMED (${state.chain.chainLength} TXs, ${state.chain.totalFees} sats fees)`, COLORS.green);
           state.cyclesCompleted++;
           state.totalFeesPaid += state.chain.totalFees;
           state.chain = null;
-          
-          // Brief pause before next cycle
           await sleep(POST_CONFIRM_DELAY_MS);
           continue;
         }
@@ -266,17 +280,21 @@ async function runMiningLoop(state: MinerState): Promise<void> {
 
       } else {
         // ─── 5. No active chain - evaluate new mint ───────
+        // POST-BLOCK is optimal time: M is lowest right after a block clears
+        if (newBlockDetected && strategy.shouldMine) {
+          log(`  ⚡ Post-block window — optimal time to mine!`, COLORS.bright + COLORS.cyan);
+        }
+
         if (strategy.shouldMine && strategy.optimalMints > 0 && !state.isMinting) {
           logNewMintDecision(strategy, fees, scan);
 
-          // Select best UTXO (largest confirmed)
           const utxos = await fetchUtxos(state.wallet.address);
           const confirmedUtxos = utxos.filter(u => u.confirmed);
           
           if (confirmedUtxos.length === 0) {
             log('  ⏳ No confirmed UTXOs available, waiting...', COLORS.yellow);
           } else {
-            const bestUtxo = confirmedUtxos[0]; // Largest
+            const bestUtxo = confirmedUtxos[0];
             const minNeeded = strategy.optimalMints * Math.ceil(TX_VSIZE * fees.nextBlockFee + 330);
             
             if (bestUtxo.value < minNeeded) {
@@ -308,7 +326,6 @@ async function runMiningLoop(state: MinerState): Promise<void> {
             }
           }
         } else if (!strategy.shouldMine) {
-          // Waiting mode - show why
           log(`  💤 ${strategy.reason}`, COLORS.gray);
         }
       }
@@ -329,8 +346,8 @@ async function runMiningLoop(state: MinerState): Promise<void> {
       }
     }
 
-    // Wait before next loop iteration
-    await sleep(POLL_INTERVAL_MS);
+    // Wait before next block check
+    await sleep(BLOCK_CHECK_INTERVAL_MS);
   }
 }
 

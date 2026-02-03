@@ -63,7 +63,11 @@ export const ESPLORA_API = 'https://blockstream.info/api';
 // ═══════════════════════════════════════════════════════════════
 
 /** Main loop interval (ms) */
-export const POLL_INTERVAL_MS = 12_000;
+/** Block height check interval - frequent, cheap call */
+export const BLOCK_CHECK_INTERVAL_MS = 30_000;
+
+/** Full assessment interval when no new block (fallback) */
+export const IDLE_POLL_INTERVAL_MS = 180_000;
 
 /** Competition scan interval (ms) */
 export const COMPETITION_SCAN_INTERVAL_MS = 15_000;
