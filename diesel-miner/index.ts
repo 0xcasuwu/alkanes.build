@@ -35,7 +35,7 @@ import {
 } from './minter.js';
 import {
   BLOCK_CHECK_INTERVAL_MS,
-  IDLE_POLL_INTERVAL_MS,
+  
   MIN_BALANCE_SATS,
   DEFAULT_BLOCK_REWARD,
   DEFAULT_DIESEL_PRICE_SATS,
@@ -125,30 +125,15 @@ function logStatus(
 
 async function runMiningLoop(state: MinerState): Promise<void> {
   log('Mining loop active — block-aware monitoring...', COLORS.green);
-  log(`  Block check: every ${BLOCK_CHECK_INTERVAL_MS/1000}s | Full assessment: on new block or every ${IDLE_POLL_INTERVAL_MS/60000}min`, COLORS.gray);
+  log(`  Polling every ${BLOCK_CHECK_INTERVAL_MS/1000}s | Mining window: ${MINING_WINDOW_START_MS/60000}min after block`, COLORS.gray);
   
   let lastFundingNotice = 0;
-  let lastFullAssessment = 0;
 
   while (true) {
     try {
-      // ─── Quick block height check (cheap) ───────────────
+      // ─── Fetch current state ───────────────────────────────
       const blockHeight = await fetchBlockHeight();
       const newBlockDetected = blockHeight > state.lastBlockHeight && state.lastBlockHeight > 0;
-      const timeSinceAssessment = Date.now() - lastFullAssessment;
-      const hasActiveChain = state.chain !== null;
-      
-      // Decide whether to do full assessment
-      const shouldAssess = newBlockDetected || 
-                           timeSinceAssessment > IDLE_POLL_INTERVAL_MS ||
-                           hasActiveChain ||
-                           lastFullAssessment === 0;
-      
-      if (!shouldAssess) {
-        // Just a quick block check - sleep and continue
-        await sleep(BLOCK_CHECK_INTERVAL_MS);
-        continue;
-      }
 
       // ─── Full assessment ────────────────────────────────
       if (newBlockDetected) {
@@ -167,7 +152,6 @@ async function runMiningLoop(state: MinerState): Promise<void> {
 
       const scan = await scanCompetition(fees.nextBlockFee);
       const now = Date.now();
-      lastFullAssessment = now;
 
       // How long since last block?
       const msSinceBlock = now - state.lastBlockTime;
